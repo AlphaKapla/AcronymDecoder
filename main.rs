@@ -1,0 +1,588 @@
+//! Acronym Lookup — Windows Background Tool (Rust)
+//!
+//! Hotkeys:
+//!   Ctrl+Shift+A   look up the word at the cursor
+//!   Ctrl+Shift+E   open the CSV file in the default editor
+//!   Ctrl+Shift+Q   quit
+//!
+//! The CSV file:
+//!   * Two columns: acronym, definition
+//!   * Lives next to the .exe by default (file name: `acronyms.csv`)
+//!   * Override with a CLI argument:
+//!         acronym-lookup.exe "C:\path\to\my-list.csv"
+//!   * Reloaded on every press, so edits show up immediately
+//!   * Same acronym can appear on multiple rows — all definitions are
+//!     shown together
+//!
+//! Lookup strategy (first match wins):
+//!   1. Exact match (case-insensitive) on the uppercased term
+//!   2. Substring match — keys that contain the query, or queries that
+//!      contain a key (≥3 chars). Catches plural / inflected forms
+//!   3. Levenshtein-distance match — distance ≤1 for short queries,
+//!      ≤2 for queries of length ≥6. Catches typos
+//!
+//! Build & run:
+//!     cargo run --release
+//!     cargo run --release -- "C:\path\to\my-list.csv"
+
+#![windows_subsystem = "console"]
+
+use std::collections::HashMap;
+use std::env;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use native_windows_gui as nwg;
+
+use windows::core::{Interface, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern,
+    TextUnit_Word, UIA_TextPatternId, UIA_ValuePatternId,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_SHIFT,
+};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetCursorPos, GetMessageW, MessageBoxW, TranslateMessage,
+    MB_ICONERROR, MB_OK, MB_TOPMOST, MSG, SW_SHOWNORMAL, WM_HOTKEY,
+};
+
+// ----- configuration --------------------------------------------------------
+const HOTKEY_LOOKUP: i32 = 1;
+const HOTKEY_QUIT:   i32 = 2;
+const HOTKEY_EDIT:   i32 = 3;
+const VK_A: u32 = 0x41;
+const VK_E: u32 = 0x45;
+const VK_Q: u32 = 0x51;
+
+const CSV_FILE_NAME: &str = "acronyms.csv";
+
+// Suggestion tuning
+const SUGGESTION_LIMIT: usize = 5;
+const SUBSTRING_MIN_LEN: usize = 3;
+
+// ---------------------------------------------------------------------------
+// A single popup-in-flight at a time. The flag is cleared from the
+// popup thread once the window closes, so spamming the hotkey doesn't
+// stack windows on top of each other.
+// ---------------------------------------------------------------------------
+fn popup_busy() -> &'static AtomicBool {
+    static FLAG: OnceLock<AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| AtomicBool::new(false))
+}
+
+// ----- entry point ----------------------------------------------------------
+fn main() -> windows::core::Result<()> {
+    let path = csv_path();
+
+    println!("============================================================");
+    println!("  Acronym Lookup running in the background.");
+    println!("  Lookup : Ctrl+Shift+A   (hover over a word, then press)");
+    println!("  Edit   : Ctrl+Shift+E   (open the CSV in your editor)");
+    println!("  Quit   : Ctrl+Shift+Q");
+    println!("  CSV    : {}", path.display());
+    match load_acronyms(&path) {
+        Ok(map) => {
+            let total: usize = map.values().map(|v| v.len()).sum();
+            println!("  Loaded {} unique acronym(s), {} definition(s).", map.len(), total);
+        }
+        Err(e) => println!("  WARNING: {}", e),
+    }
+    println!("============================================================");
+
+    // NWG runs on whichever thread calls nwg::init / nwg::dispatch_thread_events;
+    // we always create popups on a fresh thread, so init happens there.
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        RegisterHotKey(HWND::default(), HOTKEY_LOOKUP, MOD_CONTROL | MOD_SHIFT, VK_A)?;
+        RegisterHotKey(HWND::default(), HOTKEY_EDIT,   MOD_CONTROL | MOD_SHIFT, VK_E)?;
+        RegisterHotKey(HWND::default(), HOTKEY_QUIT,   MOD_CONTROL | MOD_SHIFT, VK_Q)?;
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
+            if msg.message == WM_HOTKEY {
+                match msg.wParam.0 as i32 {
+                    HOTKEY_QUIT => break,
+                    HOTKEY_LOOKUP => {
+                        std::thread::spawn(do_lookup);
+                    }
+                    HOTKEY_EDIT => {
+                        std::thread::spawn(open_csv_in_editor);
+                    }
+                    _ => {}
+                }
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        let _ = UnregisterHotKey(HWND::default(), HOTKEY_LOOKUP);
+        let _ = UnregisterHotKey(HWND::default(), HOTKEY_EDIT);
+        let _ = UnregisterHotKey(HWND::default(), HOTKEY_QUIT);
+    }
+    Ok(())
+}
+
+// ----- per-press worker -----------------------------------------------------
+fn do_lookup() {
+    if popup_busy().swap(true, Ordering::AcqRel) {
+        // A popup is already open; ignore this press.
+        return;
+    }
+
+    let raw  = unsafe { get_text_at_cursor() };
+    let term = raw.as_deref().and_then(extract_candidate_acronym);
+
+    let result = match term {
+        Some(t) => {
+            let r = lookup(&t);
+            (t, r)
+        }
+        None => (
+            "Nothing detected".to_string(),
+            LookupResult::Error(
+                "Could not detect any text at the cursor position.\n\n\
+                 Try hovering directly over the word and try again. Some apps \
+                 (certain games, custom-rendered canvases) do not expose their \
+                 text via the Windows accessibility API."
+                    .to_string(),
+            ),
+        ),
+    };
+
+    show_popup(&result.0, result.1);
+    popup_busy().store(false, Ordering::Release);
+}
+
+// ----- open the CSV in the default editor ----------------------------------
+fn open_csv_in_editor() {
+    let path = csv_path();
+
+    if !path.exists() {
+        // Create an empty file with a header row so editing has somewhere
+        // to start. This keeps the "edit" hotkey useful on first run.
+        if let Err(e) = std::fs::write(&path, "acronym,definition\n") {
+            error_box(&format!(
+                "Could not create '{}':\n\n{}",
+                path.display(),
+                e
+            ));
+            return;
+        }
+    }
+
+    // ShellExecuteW with verb "open" runs the file's default-handler
+    // association. For .csv that's usually Excel, but the user's
+    // preference (e.g. Notepad, VS Code) is honoured if they've changed
+    // it via Open With → "Always use this app".
+    let path_w: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let verb_w: Vec<u16> = "open\0".encode_utf16().collect();
+
+    unsafe {
+        let result = ShellExecuteW(
+            HWND::default(),
+            PCWSTR(verb_w.as_ptr()),
+            PCWSTR(path_w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        // Per docs, ShellExecuteW returns >32 on success.
+        if (result.0 as isize) <= 32 {
+            error_box(&format!(
+                "Could not open '{}' in the default editor.",
+                path.display()
+            ));
+        }
+    }
+}
+
+use std::os::windows::ffi::OsStrExt;
+
+// ----- where the CSV lives --------------------------------------------------
+fn csv_path() -> PathBuf {
+    if let Some(arg) = env::args().nth(1) {
+        return PathBuf::from(arg);
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(CSV_FILE_NAME)))
+        .unwrap_or_else(|| PathBuf::from(CSV_FILE_NAME))
+}
+
+// ----- CSV loader -----------------------------------------------------------
+//
+// Returns a map from uppercased acronym -> Vec<definition>. Multiple rows
+// with the same key are preserved as separate entries.
+fn load_acronyms(path: &Path) -> Result<HashMap<String, Vec<String>>, String> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .trim(csv::Trim::All)
+        .from_path(path)
+        .map_err(|e| format!("Could not open '{}': {}", path.display(), e))?;
+
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for (idx, result) in reader.records().enumerate() {
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if record.len() < 2 { continue; }
+
+        let key   = record[0].to_ascii_uppercase();
+        let value = record[1].to_string();
+        if key.is_empty() || value.is_empty() { continue; }
+
+        if idx == 0 && matches!(
+            key.as_str(),
+            "ACRONYM" | "TERM" | "KEY" | "ABBREVIATION" | "ABBR"
+        ) {
+            continue;
+        }
+
+        map.entry(key).or_default().push(value);
+    }
+    Ok(map)
+}
+
+// ----- lookup ---------------------------------------------------------------
+enum LookupResult {
+    /// Exact match: `(key, all definitions)`
+    Exact(String, Vec<String>),
+    /// No exact match, but suggestions to offer. `(query, [(key, distance, definitions)])`
+    Suggestions(String, Vec<(String, usize, Vec<String>)>),
+    /// No exact match and no suggestions. `(query, total entries searched)`
+    NotFound(String, usize),
+    /// Anything that prevented us from looking up at all (e.g. file missing).
+    Error(String),
+}
+
+fn lookup(term: &str) -> LookupResult {
+    let path = csv_path();
+    let map = match load_acronyms(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            return LookupResult::Error(format!(
+                "Could not load acronyms file.\n\n\
+                 {}\n\n\
+                 Expected location:\n  {}\n\n\
+                 Create a CSV file with two columns (acronym, definition) at \
+                 that path, or pass a different path as a command-line argument:\n  \
+                 acronym-lookup.exe \"C:\\path\\to\\your-file.csv\"",
+                e,
+                path.display()
+            ));
+        }
+    };
+
+    let key = term.to_ascii_uppercase();
+
+    // 1. Exact match.
+    if let Some(defs) = map.get(&key) {
+        return LookupResult::Exact(key, defs.clone());
+    }
+
+    // 2. Substring match (only meaningful for queries of decent length).
+    let mut substring_hits: Vec<(String, Vec<String>)> = Vec::new();
+    if key.len() >= SUBSTRING_MIN_LEN {
+        for (k, defs) in &map {
+            if k == &key { continue; }
+            if k.contains(&key) || key.contains(k.as_str()) {
+                substring_hits.push((k.clone(), defs.clone()));
+            }
+        }
+    }
+
+    // 3. Levenshtein for typos. Threshold tightens for short queries
+    //    so that "API" doesn't match "AWS" at distance 2.
+    let lev_threshold: usize = if key.len() <= 3 { 1 }
+                               else if key.len() <= 5 { 1 }
+                               else { 2 };
+
+    let mut lev_hits: Vec<(String, usize, Vec<String>)> = Vec::new();
+    for (k, defs) in &map {
+        if k == &key { continue; }
+        // Cheap length filter — distance is at least |len_a - len_b|.
+        if k.len().abs_diff(key.len()) > lev_threshold { continue; }
+        let d = levenshtein(&key, k);
+        if d <= lev_threshold {
+            lev_hits.push((k.clone(), d, defs.clone()));
+        }
+    }
+
+    if substring_hits.is_empty() && lev_hits.is_empty() {
+        return LookupResult::NotFound(term.to_string(), map.values().map(|v| v.len()).sum());
+    }
+
+    // Merge suggestions: substring matches get pseudo-distance 0 so
+    // they sort to the top, ahead of Levenshtein matches.
+    let mut combined: Vec<(String, usize, Vec<String>)> = Vec::new();
+    for (k, defs) in substring_hits {
+        combined.push((k, 0, defs));
+    }
+    for (k, d, defs) in lev_hits {
+        if !combined.iter().any(|(existing, _, _)| existing == &k) {
+            combined.push((k, d, defs));
+        }
+    }
+    combined.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    combined.truncate(SUGGESTION_LIMIT);
+
+    LookupResult::Suggestions(term.to_string(), combined)
+}
+
+// ----- Levenshtein (iterative, two-row) -------------------------------------
+fn levenshtein(a: &str, b: &str) -> usize {
+    if a == b { return 0; }
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() { return b.len(); }
+    if b.is_empty() { return a.len(); }
+
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b.len() + 1];
+
+    for i in 1..=a.len() {
+        curr[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)         // deletion
+                .min(curr[j - 1] + 1)        // insertion
+                .min(prev[j - 1] + cost);    // substitution
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+// ----- UI Automation: read the word at the cursor ---------------------------
+unsafe fn get_text_at_cursor() -> Option<String> {
+    let mut pt = POINT::default();
+    GetCursorPos(&mut pt).ok()?;
+
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+    let uia: IUIAutomation =
+        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+    let element = uia.ElementFromPoint(pt).ok()?;
+
+    if let Ok(pattern) = element.GetCurrentPattern(UIA_TextPatternId) {
+        if let Ok(text_pattern) = pattern.cast::<IUIAutomationTextPattern>() {
+            if let Ok(range) = text_pattern.RangeFromPoint(pt) {
+                let _ = range.ExpandToEnclosingUnit(TextUnit_Word);
+                if let Ok(bstr) = range.GetText(-1) {
+                    let s = bstr.to_string();
+                    if !s.trim().is_empty() {
+                        return Some(s.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(name) = element.CurrentName() {
+        let s = name.to_string();
+        if !s.trim().is_empty() {
+            return Some(s.trim().to_string());
+        }
+    }
+
+    if let Ok(pattern) = element.GetCurrentPattern(UIA_ValuePatternId) {
+        if let Ok(vp) = pattern.cast::<IUIAutomationValuePattern>() {
+            if let Ok(value) = vp.CurrentValue() {
+                let s = value.to_string();
+                if !s.trim().is_empty() {
+                    return Some(s.trim().to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// ----- pick the most acronym-shaped token from whatever UIA returned -------
+fn extract_candidate_acronym(text: &str) -> Option<String> {
+    let tokens: Vec<&str> = text
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '&')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let acronym = tokens
+        .iter()
+        .copied()
+        .filter(|t| {
+            t.len() >= 2
+                && t.chars().any(|c| c.is_ascii_alphabetic())
+                && t.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '&')
+        })
+        .max_by_key(|s| s.len());
+
+    acronym
+        .map(str::to_string)
+        .or_else(|| tokens.first().map(|s| s.to_string()))
+}
+
+// ----- formatting -----------------------------------------------------------
+fn format_lookup(term: &str, result: &LookupResult) -> (String, String) {
+    match result {
+        LookupResult::Exact(key, defs) => {
+            let body = if defs.len() == 1 {
+                defs[0].clone()
+            } else {
+                let mut s = format!("{} definitions found:\r\n\r\n", defs.len());
+                for (i, d) in defs.iter().enumerate() {
+                    s.push_str(&format!("{}. {}\r\n\r\n", i + 1, d));
+                }
+                s.trim_end().to_string()
+            };
+            (key.clone(), body)
+        }
+        LookupResult::Suggestions(query, hits) => {
+            let mut s = format!(
+                "'{}' is not in your acronyms file.\r\n\r\nDid you mean:\r\n\r\n",
+                query
+            );
+            for (k, _d, defs) in hits {
+                if defs.len() == 1 {
+                    s.push_str(&format!("  {}  —  {}\r\n", k, defs[0]));
+                } else {
+                    s.push_str(&format!("  {}\r\n", k));
+                    for d in defs {
+                        s.push_str(&format!("      • {}\r\n", d));
+                    }
+                }
+            }
+            (format!("Not found: {}", query), s.trim_end().to_string())
+        }
+        LookupResult::NotFound(query, total) => (
+            format!("Not found: {}", query),
+            format!(
+                "'{}' is not in your acronyms file, and no near matches were found.\r\n\r\n\
+                 Searched {} definition(s).\r\n\r\n\
+                 Press Ctrl+Shift+E to open the CSV and add it.",
+                query, total
+            ),
+        ),
+        LookupResult::Error(msg) => (
+            "Error".to_string(),
+            msg.replace('\n', "\r\n"),
+        ),
+    }
+}
+
+// ----- popup window (native-windows-gui) -----------------------------------
+//
+// Runs on its own thread. NWG's dispatch_thread_events drives a private
+// message loop until the window closes; the function returns and the
+// thread exits. The popup_busy flag (set by the caller) ensures only
+// one popup is alive at a time.
+fn show_popup(term: &str, result: LookupResult) {
+    let (title, body) = format_lookup(term, &result);
+
+    nwg::init().ok();
+    let _ = nwg::Font::set_global_family("Segoe UI");
+
+    let mut window = Default::default();
+    let mut text   = Default::default();
+    let mut button = Default::default();
+
+    // Position near the cursor but kept on-screen.
+    let cursor = nwg::GlobalCursor::position();
+    let (w, h) = (520, 320);
+    let pos = (cursor.0 + 16, cursor.1 + 16);
+
+    nwg::Window::builder()
+        .size((w, h))
+        .position(pos)
+        .title(&format!("Acronym - {}", title))
+        .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::VISIBLE | nwg::WindowFlags::POPUP)
+        .topmost(true)
+        .build(&mut window)
+        .expect("popup window");
+
+    nwg::TextBox::builder()
+        .text(&body)
+        .parent(&window)
+        .size((w - 24, h - 70))
+        .position((10, 10))
+        .readonly(true)
+        .flags(nwg::TextBoxFlags::VISIBLE
+            | nwg::TextBoxFlags::AUTOVSCROLL
+            | nwg::TextBoxFlags::VSCROLL)
+        .build(&mut text)
+        .expect("text box");
+
+    nwg::Button::builder()
+        .text("Close (Esc)")
+        .parent(&window)
+        .size((110, 28))
+        .position((w - 124, h - 48))
+        .build(&mut button)
+        .expect("button");
+
+    let window  = Arc::new(window);
+    let win_a   = window.clone();
+    let win_b   = window.clone();
+    let btn_h   = button.handle;
+
+    let handler = nwg::full_bind_event_handler(&window.handle, move |evt, _data, handle| {
+        match evt {
+            nwg::Event::OnButtonClick if handle == btn_h => {
+                nwg::stop_thread_dispatch();
+                win_a.set_visible(false);
+            }
+            nwg::Event::OnWindowClose => {
+                nwg::stop_thread_dispatch();
+                win_b.set_visible(false);
+            }
+            _ => {}
+        }
+    });
+
+    // Esc closes — handled via a one-shot timer that polls GetAsyncKeyState
+    // would be over-engineering. NWG dispatches accelerators at the
+    // top-level message loop, so we install a trivial accelerator table.
+    // Simpler path: keyboard handler at the window level.
+    let win_c = window.clone();
+    let _esc = nwg::bind_raw_event_handler(&window.handle, 0xffff, move |_h, msg, w, _l| {
+        const WM_KEYDOWN: u32 = 0x0100;
+        const VK_ESCAPE: usize = 0x1B;
+        if msg == WM_KEYDOWN && w == VK_ESCAPE {
+            nwg::stop_thread_dispatch();
+            win_c.set_visible(false);
+        }
+        None
+    });
+
+    let _ = text; // hold ownership for the lifetime of the message loop
+    nwg::dispatch_thread_events();
+    nwg::unbind_event_handler(&handler);
+}
+
+// ----- a tiny error box for the edit hotkey --------------------------------
+fn error_box(message: &str) {
+    unsafe {
+        let title = HSTRING::from("Acronym Lookup");
+        let body  = HSTRING::from(message);
+        MessageBoxW(
+            HWND::default(),
+            &body,
+            &title,
+            MB_OK | MB_ICONERROR | MB_TOPMOST,
+        );
+    }
+}

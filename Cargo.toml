@@ -1,0 +1,24 @@
+[package]
+name = "acronym-lookup"
+version = "0.1.0"
+edition = "2021"
+description = "Hover over a word, press Ctrl+Shift+A, get the definition from your personal CSV."
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+csv = "1"
+native-windows-gui     = { version = "1.0", default-features = false, features = ["textbox", "button", "cursor", "message-window"] }
+native-windows-derive  = "1.0"
+
+[profile.release]
+lto       = true
+opt-level = "z"
+strip     = true
+codegen-units = 1
