@@ -1,0 +1,19 @@
+# Statically link the MSVC C runtime into the binary.
+#
+# Without this, the binary depends on vcruntime140.dll / ucrtbase.dll at
+# load time.  If the version of those DLLs on the target machine is older
+# than the one the compiler was built against, Windows raises
+# STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) before any user code runs.
+#
+# With +crt-static every CRT symbol is compiled directly into the .exe, so
+# there is no CRT DLL dependency at all.  This is the standard practice for
+# distributing self-contained Rust binaries on Windows.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
