@@ -65,7 +65,7 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, SendInput, UnregisterHotKey,
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    MOD_CONTROL, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL,
+    MOD_CONTROL, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -502,7 +502,40 @@ unsafe fn get_selected_via_clipboard() -> Option<String> {
     // ── 3. Record the sequence number then send Ctrl+C ──
     let seq_before = GetClipboardSequenceNumber();
 
-    let inputs: [INPUT; 4] = [
+    // Release Shift and Ctrl first: the hotkey that triggered this code is
+    // Ctrl+Shift+A, so those modifier keys may still be physically held down
+    // when we get here.  If Shift is held when we inject Ctrl+C the target
+    // application receives Ctrl+Shift+C (not a copy command).
+    // After releasing both, only Ctrl is re-pressed (as part of Ctrl+C);
+    // Shift is intentionally left released for the duration of the copy.
+    let inputs: [INPUT; 6] = [
+        // Release Shift (may be physically held from the Ctrl+Shift+A hotkey).
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_SHIFT,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        // Release Ctrl (may be physically held from the Ctrl+Shift+A hotkey).
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_CONTROL,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        // Press Ctrl+C.
         INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -615,12 +648,13 @@ unsafe fn get_selected_via_clipboard() -> Option<String> {
 unsafe fn get_text_at_cursor() -> Option<String> {
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-    let uia: IUIAutomation =
-        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
-
     // ── 1. Try UI Automation selection ──────────────────────────────────────
-    if let Some(s) = get_selected_text(&uia) {
-        return Some(s);
+    // CoCreateInstance may fail on some configurations; do not short-circuit
+    // with `?` here — always fall through to the clipboard fallback.
+    if let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+        if let Some(s) = get_selected_text(&uia) {
+            return Some(s);
+        }
     }
 
     // ── 2. Fall back to clipboard simulation (Ctrl+C) ───────────────────────
