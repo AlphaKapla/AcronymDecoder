@@ -1,7 +1,7 @@
 //! Acronym Lookup — Windows Background Tool (Rust)
 //!
 //! Hotkeys:
-//!   Ctrl+Shift+A   look up the selected word (falls back to word at cursor)
+//!   Ctrl+Shift+A   look up the selected word
 //!   Ctrl+Shift+E   open the CSV file in the default editor
 //!   Ctrl+Shift+Q   quit
 //!
@@ -21,6 +21,15 @@
 //!   3. Levenshtein-distance match — distance ≤1 for short queries,
 //!      ≤2 for queries of length ≥6. Catches typos
 //!
+//! Word detection strategy (first success wins):
+//!   1. UI Automation TextPattern selection — reads the currently selected
+//!      text from the focused element's accessibility API
+//!   2. Clipboard simulation — sends Ctrl+C to the foreground window, reads
+//!      the clipboard, then restores the previous clipboard content. Works
+//!      with applications that don't expose a TextPattern (e.g. Adobe
+//!      Acrobat). If nothing is selected in the target app, the clipboard is
+//!      left unchanged and no lookup is performed.
+//!
 //! Build & run:
 //!     cargo run --release
 //!     cargo run --release -- "C:\path\to\my-list.csv"
@@ -34,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH, DEFAULT_GUI_FONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Com::{
@@ -43,13 +52,20 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
 };
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+    OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern,
-    TextUnit_Word, UIA_TextPatternId, UIA_ValuePatternId,
+    CUIAutomation, IUIAutomation, IUIAutomationTextPattern,
+    UIA_TextPatternId,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_SHIFT,
+    RegisterHotKey, SendInput, UnregisterHotKey,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    MOD_CONTROL, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -120,7 +136,7 @@ fn main() -> windows::core::Result<()> {
 
     println!("============================================================");
     println!("  Acronym Lookup running in the background.");
-    println!("  Lookup : Ctrl+Shift+A   (hover over a word, then press)");
+    println!("  Lookup : Ctrl+Shift+A   (select a word, then press)");
     println!("  Edit   : Ctrl+Shift+E   (open the CSV in your editor)");
     println!("  Quit   : Ctrl+Shift+Q");
     println!("  CSV    : {}", path.display());
@@ -195,11 +211,12 @@ fn do_lookup() {
         None => (
             "Nothing detected".to_string(),
             LookupResult::Error(
-                "Could not detect any text.\n\n\
-                 Select a word (double-click or click-and-drag) and try again. \
-                 If no text is selected, the tool falls back to the word at the \
-                 cursor position. Some apps (certain games, custom-rendered \
-                 canvases) do not expose their text via the Windows accessibility API."
+                "Could not detect any selected text.\n\n\
+                 Select a word (double-click or click-and-drag) and try again.\n\n\
+                 The tool first reads the selection via the Windows accessibility \
+                 API (UI Automation). If that fails it retries by sending Ctrl+C \
+                 and reading the clipboard. Some applications (certain games, \
+                 custom-rendered canvases) support neither method."
                     .to_string(),
             ),
         ),
@@ -415,9 +432,10 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-// ----- UI Automation: read the selected or hovered word ----------------------
+// ----- UI Automation: read the selected text in the focused element ----------
 
-/// Tries to return the currently selected text in the focused element.
+/// Tries to return the currently selected text in the focused element via
+/// UI Automation's TextPattern. Works in most standard text controls.
 unsafe fn get_selected_text(uia: &IUIAutomation) -> Option<String> {
     let focused = uia.GetFocusedElement().ok()?;
     let pattern = focused.GetCurrentPattern(UIA_TextPatternId).ok()?;
@@ -431,94 +449,180 @@ unsafe fn get_selected_text(uia: &IUIAutomation) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s.trim().to_string()) }
 }
 
+/// Tries to get selected text by simulating Ctrl+C and reading the clipboard.
+///
+/// This works across a broad range of applications (including Adobe Acrobat)
+/// that do not expose text selection through the UI Automation API.
+///
+/// Steps:
+///   1. Save the current clipboard text (to restore it afterwards).
+///   2. Clear the clipboard so we can detect a fresh copy.
+///   3. Send Ctrl+C to the foreground window via SendInput.
+///   4. Wait briefly for the application to process the keystroke.
+///   5. Read the clipboard.  If it is empty the application had nothing
+///      selected and we return None without disturbing the previous content.
+///   6. Restore the previously saved clipboard text.
+unsafe fn get_selected_via_clipboard() -> Option<String> {
+    const CF_UNICODETEXT: u32 = 13;
+    // Virtual key code for 'C' (no named constant in the windows crate).
+    let vk_c = VIRTUAL_KEY(b'C' as u16);
+
+    // ── 1. Save current clipboard text ──
+    let saved: Option<Vec<u16>> = (|| -> Option<Vec<u16>> {
+        OpenClipboard(HWND::default()).ok()?;
+        let h = GetClipboardData(CF_UNICODETEXT).ok();
+        let result = h.and_then(|h| {
+            let ptr = GlobalLock(HGLOBAL(h.0)) as *const u16;
+            if ptr.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            // Include the null terminator so we can restore exactly.
+            let v = std::slice::from_raw_parts(ptr, len + 1).to_vec();
+            let _ = GlobalUnlock(HGLOBAL(h.0));
+            Some(v)
+        });
+        let _ = CloseClipboard();
+        result
+    })();
+
+    // ── 2. Clear the clipboard ──
+    if OpenClipboard(HWND::default()).is_ok() {
+        let _ = EmptyClipboard();
+        let _ = CloseClipboard();
+    }
+
+    // ── 3. Record the sequence number then send Ctrl+C ──
+    let seq_before = GetClipboardSequenceNumber();
+
+    let inputs: [INPUT; 4] = [
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_CONTROL,
+                    wScan: 0,
+                    dwFlags: KEYBD_EVENT_FLAGS(0),
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk_c,
+                    wScan: 0,
+                    dwFlags: KEYBD_EVENT_FLAGS(0),
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk_c,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_CONTROL,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+    ];
+    SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+
+    // ── 4. Wait for the application to process the copy ──
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // ── 5. Read new clipboard content ──
+    // If the sequence number has not changed, nothing was copied (no selection).
+    let seq_after = GetClipboardSequenceNumber();
+    let new_text: Option<String> = if seq_after == seq_before {
+        None
+    } else {
+        (|| -> Option<String> {
+            OpenClipboard(HWND::default()).ok()?;
+            let h = GetClipboardData(CF_UNICODETEXT).ok()?;
+            let ptr = GlobalLock(HGLOBAL(h.0)) as *const u16;
+            if ptr.is_null() {
+                let _ = CloseClipboard();
+                return None;
+            }
+            let mut len = 0usize;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+            let _ = GlobalUnlock(HGLOBAL(h.0));
+            let _ = CloseClipboard();
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        })()
+    };
+
+    // ── 6. Restore previous clipboard content ──
+    if OpenClipboard(HWND::default()).is_ok() {
+        let _ = EmptyClipboard();
+        if let Some(ref data) = saved {
+            let byte_size = data.len() * std::mem::size_of::<u16>();
+            if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, byte_size) {
+                let ptr = GlobalLock(hmem) as *mut u16;
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                    let _ = GlobalUnlock(hmem);
+                    // SetClipboardData takes ownership of hmem on success; only
+                    // free it ourselves if the call fails.
+                    if SetClipboardData(CF_UNICODETEXT, HANDLE(hmem.0)).is_err() {
+                        let _ = GlobalFree(hmem);
+                    }
+                } else {
+                    let _ = GlobalFree(hmem);
+                }
+            }
+        }
+        let _ = CloseClipboard();
+    }
+
+    new_text
+}
+
+/// Returns the currently selected text, trying UI Automation first and
+/// falling back to the clipboard simulation approach (Ctrl+C) for
+/// applications that do not expose selection via the accessibility API.
 unsafe fn get_text_at_cursor() -> Option<String> {
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
     let uia: IUIAutomation =
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
 
-    // ── 1. Prefer the currently selected text in the focused element ──────────
-    // This avoids the offset problem that RangeFromPoint suffers from when the
-    // mouse cursor hotspot does not align exactly with what the app thinks is
-    // "under the pointer".
+    // ── 1. Try UI Automation selection ──────────────────────────────────────
     if let Some(s) = get_selected_text(&uia) {
         return Some(s);
     }
 
-    // ── 2. Fall back: word at the mouse-cursor position ───────────────────────
-    let mut pt = POINT::default();
-    GetCursorPos(&mut pt).ok()?;
-
-    let element = uia.ElementFromPoint(pt).ok()?;
-
-    // If the element exposes a TextPattern it is a document/text-view control
-    // (e.g. a PDF page in Adobe Acrobat).  In that case we only trust what
-    // RangeFromPoint gives us and do NOT fall through to CurrentName() or
-    // ValuePattern: those would return the element's own label (e.g.
-    // "AVPageView") instead of the word under the cursor.
-    if let Ok(pattern) = element.GetCurrentPattern(UIA_TextPatternId) {
-        if let Ok(text_pattern) = pattern.cast::<IUIAutomationTextPattern>() {
-            if let Ok(range) = text_pattern.RangeFromPoint(pt) {
-                let _ = range.ExpandToEnclosingUnit(TextUnit_Word);
-                if let Ok(bstr) = range.GetText(-1) {
-                    let s = bstr.to_string();
-                    if !s.trim().is_empty() {
-                        return Some(s.trim().to_string());
-                    }
-                }
-            }
-        }
-        // The element is a text-bearing control but the cursor was over
-        // whitespace or an area that yielded no word — return nothing rather
-        // than a stale control name.
-        return None;
-    }
-
-    // The element at point does not expose TextPattern directly.  In some
-    // PDF viewers (e.g. Adobe Acrobat) ElementFromPoint returns an internal
-    // sub-element whose parent — the focused document view (AVPageView) —
-    // *does* expose TextPattern.  Try the focused element before falling
-    // through to CurrentName(), which would otherwise return the control's
-    // own identifier ("AVPageView") rather than the word under the cursor.
-    if let Ok(focused) = uia.GetFocusedElement() {
-        if let Ok(pattern) = focused.GetCurrentPattern(UIA_TextPatternId) {
-            if let Ok(text_pattern) = pattern.cast::<IUIAutomationTextPattern>() {
-                if let Ok(range) = text_pattern.RangeFromPoint(pt) {
-                    let _ = range.ExpandToEnclosingUnit(TextUnit_Word);
-                    if let Ok(bstr) = range.GetText(-1) {
-                        let s = bstr.to_string();
-                        if !s.trim().is_empty() {
-                            return Some(s.trim().to_string());
-                        }
-                    }
-                }
-            }
-            // The focused element is a text-bearing document control.
-            // Do NOT fall through to CurrentName() / ValuePattern — those
-            // would return the control's own label (e.g. "AVPageView").
-            return None;
-        }
-    }
-
-    if let Ok(name) = element.CurrentName() {
-        let s = name.to_string();
-        if !s.trim().is_empty() {
-            return Some(s.trim().to_string());
-        }
-    }
-
-    if let Ok(pattern) = element.GetCurrentPattern(UIA_ValuePatternId) {
-        if let Ok(vp) = pattern.cast::<IUIAutomationValuePattern>() {
-            if let Ok(value) = vp.CurrentValue() {
-                let s = value.to_string();
-                if !s.trim().is_empty() {
-                    return Some(s.trim().to_string());
-                }
-            }
-        }
-    }
-
-    None
+    // ── 2. Fall back to clipboard simulation (Ctrl+C) ───────────────────────
+    // This handles applications such as Adobe Acrobat whose PDF rendering
+    // layer does not expose a UIA TextPattern but does respond to Ctrl+C.
+    get_selected_via_clipboard()
 }
 
 // ----- pick the most acronym-shaped token from whatever UIA returned -------
