@@ -5,7 +5,7 @@ use std::path::PathBuf;
 fn main() {
     // Copy acronyms.csv (repo root) into the Cargo output directory so that
     // `cargo run` finds the file next to the compiled executable.
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"));
     // OUT_DIR is <profile>/build/<crate>/out – the exe lives two levels up.
     let exe_dir = out_dir
         .ancestors()
@@ -16,7 +16,7 @@ fn main() {
     let src = PathBuf::from("acronyms.csv");
     let dst = exe_dir.join("acronyms.csv");
 
-    if src.exists() && !dst.exists() {
+    if src.exists() {
         fs::copy(&src, &dst).expect("failed to copy acronyms.csv");
     }
 
