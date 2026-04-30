@@ -31,12 +31,12 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use native_windows_gui as nwg;
-
-use windows::core::{Interface, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, WPARAM};
+use windows::core::{Interface, PCWSTR};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH, DEFAULT_GUI_FONT};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
@@ -53,8 +53,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, GetMessageW, MessageBoxW, PostThreadMessageW,
-    TranslateMessage, MB_ICONERROR, MB_OK, MB_TOPMOST, MSG, SW_SHOWNORMAL, WM_HOTKEY, WM_QUIT,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GetCursorPos, GetMessageW, IDC_ARROW,
+    IsDialogMessageW, LoadCursorW, MB_ICONERROR, MB_OK, MB_TOPMOST, MessageBoxW, MSG,
+    PostQuitMessage, PostThreadMessageW, RegisterClassExW, SendMessageW, SW_SHOWNORMAL,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_SETFONT, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_EX_TOPMOST, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL, HMENU,
 };
 
 // ----- configuration --------------------------------------------------------
@@ -525,104 +530,173 @@ fn format_lookup(_term: &str, result: &LookupResult) -> (String, String) {
     }
 }
 
-// ----- popup window (native-windows-gui) -----------------------------------
+// ----- popup window (raw Win32) --------------------------------------------
 //
-// Runs on its own thread. NWG's dispatch_thread_events drives a private
-// message loop until the window closes; the function returns and the
-// thread exits. The popup_busy flag (set by the caller) ensures only
-// one popup is alive at a time.
+// Runs on its own thread. The message loop drives the popup until the user
+// closes it; the function returns and the thread exits. The popup_busy flag
+// (set by the caller) ensures only one popup is alive at a time.
+//
+// Using raw Win32 avoids the native-windows-gui dependency on Shcore.dll
+// (SetProcessDpiAwareness, Windows 8.1+) that caused STATUS_ENTRYPOINT_NOT_FOUND
+// on older Windows versions.
+
+/// Window procedure for the popup. Handles button click, Esc (sent by
+/// IsDialogMessageW as WM_COMMAND(IDCANCEL=2)), and the × close button.
+unsafe extern "system" fn popup_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    const IDCANCEL: usize = 2;
+    match msg {
+        WM_COMMAND => {
+            // Low word of wParam is the control/notification ID.
+            if wparam.0 & 0xffff == IDCANCEL {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
 fn show_popup(term: &str, result: LookupResult) {
     let (title, body) = format_lookup(term, &result);
 
-    nwg::init().ok();
-    let _ = nwg::Font::set_global_family("Segoe UI");
+    unsafe {
+        let hmodule  = GetModuleHandleW(None).unwrap_or_default();
+        let hinstance = HINSTANCE(hmodule.0);
 
-    let mut window = Default::default();
-    let mut text   = Default::default();
-    let mut button = Default::default();
+        // Register the window class once per process; ignore "already exists".
+        let class_name = windows::core::w!("AcronymLookupPopup");
+        let wc = WNDCLASSEXW {
+            cbSize:        std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc:   Some(popup_wnd_proc),
+            hInstance:     hinstance,
+            hCursor:       LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            // Standard Win32 trick: passing (COLOR_BTNFACE+1) as a pseudo-brush.
+            // COLOR_BTNFACE = 15, so 15+1 = 16.
+            hbrBackground: HBRUSH(16),
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
 
-    // Position near the cursor but kept on-screen.
-    let cursor = nwg::GlobalCursor::position();
-    let (w, h) = (520, 320);
-    let pos = (cursor.0 + 16, cursor.1 + 16);
+        // Compute total window size from the desired 520×320 client area.
+        let client_w: i32 = 520;
+        let client_h: i32 = 320;
+        let mut rect = RECT { left: 0, top: 0, right: client_w, bottom: client_h };
+        let _ = AdjustWindowRectEx(
+            &mut rect,
+            WS_CAPTION | WS_SYSMENU,
+            BOOL(0),
+            WS_EX_TOPMOST,
+        );
+        let win_w = rect.right  - rect.left;
+        let win_h = rect.bottom - rect.top;
 
-    nwg::Window::builder()
-        .size((w, h))
-        .position(pos)
-        .title(&format!("Acronym - {}", title))
-        .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::VISIBLE | nwg::WindowFlags::POPUP)
-        .topmost(true)
-        .build(&mut window)
-        .expect("popup window");
+        // Position near the cursor.
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
 
-    nwg::TextBox::builder()
-        .text(&body)
-        .parent(&window)
-        .size((w - 24, h - 70))
-        .position((10, 10))
-        .readonly(true)
-        .flags(nwg::TextBoxFlags::VISIBLE
-            | nwg::TextBoxFlags::AUTOVSCROLL
-            | nwg::TextBoxFlags::VSCROLL)
-        .build(&mut text)
-        .expect("text box");
+        let title_w: Vec<u16> = format!("Acronym - {}", title)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
-    nwg::Button::builder()
-        .text("Close (Esc)")
-        .parent(&window)
-        .size((110, 28))
-        .position((w - 124, h - 48))
-        .build(&mut button)
-        .expect("button");
+        let hwnd = match CreateWindowExW(
+            WS_EX_TOPMOST,
+            class_name,
+            PCWSTR(title_w.as_ptr()),
+            WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            pt.x + 16,
+            pt.y + 16,
+            win_w,
+            win_h,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
 
-    let window  = Arc::new(window);
-    let win_a   = window.clone();
-    let win_b   = window.clone();
-    let btn_h   = button.handle;
+        // Use the system GUI font (Segoe UI on Vista+, MS Shell Dlg 2 on XP).
+        let hfont = GetStockObject(DEFAULT_GUI_FONT);
 
-    let handler = nwg::full_bind_event_handler(&window.handle, move |evt, _data, handle| {
-        match evt {
-            nwg::Event::OnButtonClick if handle == btn_h => {
-                nwg::stop_thread_dispatch();
-                win_a.set_visible(false);
-            }
-            nwg::Event::OnWindowClose => {
-                nwg::stop_thread_dispatch();
-                win_b.set_visible(false);
-            }
-            _ => {}
+        // Scrollable read-only edit control covering most of the client area.
+        let body_w: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
+        if let Ok(hedit) = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            windows::core::w!("EDIT"),
+            PCWSTR(body_w.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL
+                | WINDOW_STYLE(ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL),
+            10,
+            10,
+            client_w - 24,
+            client_h - 70,
+            hwnd,
+            HMENU::default(),
+            hinstance,
+            None,
+        ) {
+            SendMessageW(hedit, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
         }
-    });
 
-    // Esc closes — handled via a one-shot timer that polls GetAsyncKeyState
-    // would be over-engineering. NWG dispatches accelerators at the
-    // top-level message loop, so we install a trivial accelerator table.
-    // Simpler path: keyboard handler at the window level.
-    let win_c = window.clone();
-    let _esc = nwg::bind_raw_event_handler(&window.handle, 0xffff, move |_h, msg, w, _l| {
-        const WM_KEYDOWN: u32 = 0x0100;
-        const VK_ESCAPE: usize = 0x1B;
-        if msg == WM_KEYDOWN && w == VK_ESCAPE {
-            nwg::stop_thread_dispatch();
-            win_c.set_visible(false);
+        // Close button. ID = IDCANCEL (2) so IsDialogMessageW maps Esc → WM_COMMAND.
+        if let Ok(hbtn) = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            windows::core::w!("BUTTON"),
+            windows::core::w!("Close  (Esc)"),
+            WS_CHILD | WS_VISIBLE,
+            client_w - 124,
+            client_h - 48,
+            110,
+            28,
+            hwnd,
+            HMENU(2),
+            hinstance,
+            None,
+        ) {
+            SendMessageW(hbtn, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
         }
-        None
-    });
 
-    let _ = text; // hold ownership for the lifetime of the message loop
-    nwg::dispatch_thread_events();
-    nwg::unbind_event_handler(&handler);
+        // Message loop. IsDialogMessageW translates Esc → WM_COMMAND(IDCANCEL=2)
+        // and handles Tab focus navigation between the edit and button controls.
+        let mut msg_buf = MSG::default();
+        loop {
+            let r = GetMessageW(&mut msg_buf, HWND::default(), 0, 0);
+            if r.0 <= 0 {
+                break;
+            }
+            if IsDialogMessageW(hwnd, &msg_buf).0 == 0 {
+                TranslateMessage(&msg_buf);
+                DispatchMessageW(&msg_buf);
+            }
+        }
+    }
 }
 
 // ----- a tiny error box for the edit hotkey --------------------------------
 fn error_box(message: &str) {
+    let title: Vec<u16> = "Acronym Lookup\0".encode_utf16().collect();
+    let body:  Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        let title = HSTRING::from("Acronym Lookup");
-        let body  = HSTRING::from(message);
         MessageBoxW(
             HWND::default(),
-            &body,
-            &title,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
             MB_OK | MB_ICONERROR | MB_TOPMOST,
         );
     }
