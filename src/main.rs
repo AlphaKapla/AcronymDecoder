@@ -658,7 +658,7 @@ fn show_popup(term: &str, result: LookupResult) {
         if let Ok(hbtn) = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             windows::core::w!("BUTTON"),
-            windows::core::w!("Close  (Esc)"),
+            windows::core::w!("Close (Esc)"),
             WS_CHILD | WS_VISIBLE,
             client_w - 124,
             client_h - 48,
