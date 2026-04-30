@@ -474,6 +474,32 @@ unsafe fn get_text_at_cursor() -> Option<String> {
         return None;
     }
 
+    // The element at point does not expose TextPattern directly.  In some
+    // PDF viewers (e.g. Adobe Acrobat) ElementFromPoint returns an internal
+    // sub-element whose parent — the focused document view (AVPageView) —
+    // *does* expose TextPattern.  Try the focused element before falling
+    // through to CurrentName(), which would otherwise return the control's
+    // own identifier ("AVPageView") rather than the word under the cursor.
+    if let Ok(focused) = uia.GetFocusedElement() {
+        if let Ok(pattern) = focused.GetCurrentPattern(UIA_TextPatternId) {
+            if let Ok(text_pattern) = pattern.cast::<IUIAutomationTextPattern>() {
+                if let Ok(range) = text_pattern.RangeFromPoint(pt) {
+                    let _ = range.ExpandToEnclosingUnit(TextUnit_Word);
+                    if let Ok(bstr) = range.GetText(-1) {
+                        let s = bstr.to_string();
+                        if !s.trim().is_empty() {
+                            return Some(s.trim().to_string());
+                        }
+                    }
+                }
+            }
+            // The focused element is a text-bearing document control.
+            // Do NOT fall through to CurrentName() / ValuePattern — those
+            // would return the control's own label (e.g. "AVPageView").
+            return None;
+        }
+    }
+
     if let Ok(name) = element.CurrentName() {
         let s = name.to_string();
         if !s.trim().is_empty() {
