@@ -425,6 +425,11 @@ unsafe fn get_text_at_cursor() -> Option<String> {
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
     let element = uia.ElementFromPoint(pt).ok()?;
 
+    // If the element exposes a TextPattern it is a document/text-view control
+    // (e.g. a PDF page in Adobe Acrobat).  In that case we only trust what
+    // RangeFromPoint gives us and do NOT fall through to CurrentName() or
+    // ValuePattern: those would return the element's own label (e.g.
+    // "AVPageView") instead of the word under the cursor.
     if let Ok(pattern) = element.GetCurrentPattern(UIA_TextPatternId) {
         if let Ok(text_pattern) = pattern.cast::<IUIAutomationTextPattern>() {
             if let Ok(range) = text_pattern.RangeFromPoint(pt) {
@@ -437,6 +442,10 @@ unsafe fn get_text_at_cursor() -> Option<String> {
                 }
             }
         }
+        // The element is a text-bearing control but the cursor was over
+        // whitespace or an area that yielded no word — return nothing rather
+        // than a stale control name.
+        return None;
     }
 
     if let Ok(name) = element.CurrentName() {
