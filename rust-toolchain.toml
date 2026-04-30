@@ -1,0 +1,13 @@
+# Pin the Rust toolchain to 1.77.x.
+#
+# Rust 1.78 changed the Windows standard library to seed hash maps with
+# ProcessPrng (bcryptprimitives.dll) instead of BCryptGenRandom.
+# ProcessPrng was only added to bcryptprimitives.dll's official export table
+# in Windows 10 Build 17134 (version 1803).  On any earlier Windows release
+# the DLL exists but the symbol is absent, so the OS loader raises
+# STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) before main() is reached.
+#
+# 1.77.2 is the last stable release that uses BCryptGenRandom, which is
+# present on every Windows version since Vista.
+[toolchain]
+channel = "1.77.2"
