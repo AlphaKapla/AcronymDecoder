@@ -92,6 +92,10 @@ const CSV_FILE_NAME: &str = "acronyms.csv";
 const SUGGESTION_LIMIT: usize = 5;
 const SUBSTRING_MIN_LEN: usize = 3;
 
+// Clipboard simulation: time to wait after Ctrl+C for the target application
+// to write the selected text to the clipboard before we attempt to read it.
+const CLIPBOARD_COPY_DELAY_MS: u64 = 150;
+
 // ---------------------------------------------------------------------------
 // A single popup-in-flight at a time. The flag is cleared from the
 // popup thread once the window closes, so spamming the hotkey doesn't
@@ -465,7 +469,7 @@ unsafe fn get_selected_text(uia: &IUIAutomation) -> Option<String> {
 unsafe fn get_selected_via_clipboard() -> Option<String> {
     const CF_UNICODETEXT: u32 = 13;
     // Virtual key code for 'C' (no named constant in the windows crate).
-    let vk_c = VIRTUAL_KEY(b'C' as u16);
+    const VK_C: VIRTUAL_KEY = VIRTUAL_KEY(b'C' as u16);
 
     // ── 1. Save current clipboard text ──
     let saved: Option<Vec<u16>> = (|| -> Option<Vec<u16>> {
@@ -515,7 +519,7 @@ unsafe fn get_selected_via_clipboard() -> Option<String> {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
-                    wVk: vk_c,
+                    wVk: VK_C,
                     wScan: 0,
                     dwFlags: KEYBD_EVENT_FLAGS(0),
                     time: 0,
@@ -527,7 +531,7 @@ unsafe fn get_selected_via_clipboard() -> Option<String> {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
-                    wVk: vk_c,
+                    wVk: VK_C,
                     wScan: 0,
                     dwFlags: KEYEVENTF_KEYUP,
                     time: 0,
@@ -551,7 +555,7 @@ unsafe fn get_selected_via_clipboard() -> Option<String> {
     SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
 
     // ── 4. Wait for the application to process the copy ──
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    std::thread::sleep(std::time::Duration::from_millis(CLIPBOARD_COPY_DELAY_MS));
 
     // ── 5. Read new clipboard content ──
     // If the sequence number has not changed, nothing was copied (no selection).
