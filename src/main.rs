@@ -1,7 +1,7 @@
 //! Acronym Lookup — Windows Background Tool (Rust)
 //!
 //! Hotkeys:
-//!   Ctrl+Shift+A   look up the word at the cursor
+//!   Ctrl+Shift+A   look up the selected word (falls back to word at cursor)
 //!   Ctrl+Shift+E   open the CSV file in the default editor
 //!   Ctrl+Shift+Q   quit
 //!
@@ -195,10 +195,11 @@ fn do_lookup() {
         None => (
             "Nothing detected".to_string(),
             LookupResult::Error(
-                "Could not detect any text at the cursor position.\n\n\
-                 Try hovering directly over the word and try again. Some apps \
-                 (certain games, custom-rendered canvases) do not expose their \
-                 text via the Windows accessibility API."
+                "Could not detect any text.\n\n\
+                 Select a word (double-click or click-and-drag) and try again. \
+                 If no text is selected, the tool falls back to the word at the \
+                 cursor position. Some apps (certain games, custom-rendered \
+                 canvases) do not expose their text via the Windows accessibility API."
                     .to_string(),
             ),
         ),
@@ -414,15 +415,40 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-// ----- UI Automation: read the word at the cursor ---------------------------
-unsafe fn get_text_at_cursor() -> Option<String> {
-    let mut pt = POINT::default();
-    GetCursorPos(&mut pt).ok()?;
+// ----- UI Automation: read the selected or hovered word ----------------------
 
+/// Tries to return the currently selected text in the focused element.
+unsafe fn get_selected_text(uia: &IUIAutomation) -> Option<String> {
+    let focused = uia.GetFocusedElement().ok()?;
+    let pattern = focused.GetCurrentPattern(UIA_TextPatternId).ok()?;
+    let text_pattern = pattern.cast::<IUIAutomationTextPattern>().ok()?;
+    let ranges = text_pattern.GetSelection().ok()?;
+    if ranges.Length().ok()? == 0 {
+        return None;
+    }
+    let range = ranges.GetElement(0).ok()?;
+    let s = range.GetText(-1).ok()?.to_string();
+    if s.trim().is_empty() { None } else { Some(s.trim().to_string()) }
+}
+
+unsafe fn get_text_at_cursor() -> Option<String> {
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
     let uia: IUIAutomation =
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+
+    // ── 1. Prefer the currently selected text in the focused element ──────────
+    // This avoids the offset problem that RangeFromPoint suffers from when the
+    // mouse cursor hotspot does not align exactly with what the app thinks is
+    // "under the pointer".
+    if let Some(s) = get_selected_text(&uia) {
+        return Some(s);
+    }
+
+    // ── 2. Fall back: word at the mouse-cursor position ───────────────────────
+    let mut pt = POINT::default();
+    GetCursorPos(&mut pt).ok()?;
+
     let element = uia.ElementFromPoint(pt).ok()?;
 
     // If the element exposes a TextPattern it is a document/text-view control
