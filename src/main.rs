@@ -585,7 +585,7 @@ fn show_popup(term: &str, result: LookupResult) {
             hCursor:       LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             // Standard Win32 trick: passing (COLOR_BTNFACE+1) as a pseudo-brush.
             // COLOR_BTNFACE = 15, so 15+1 = 16.
-            hbrBackground: HBRUSH(16),
+            hbrBackground: HBRUSH(16 as *mut _),
             lpszClassName: class_name,
             ..Default::default()
         };
@@ -641,7 +641,7 @@ fn show_popup(term: &str, result: LookupResult) {
             windows::core::w!("EDIT"),
             PCWSTR(body_w.as_ptr()),
             WS_CHILD | WS_VISIBLE | WS_VSCROLL
-                | WINDOW_STYLE(ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL),
+                | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
             10,
             10,
             client_w - 24,
@@ -665,7 +665,7 @@ fn show_popup(term: &str, result: LookupResult) {
             110,
             28,
             hwnd,
-            HMENU(2),
+            HMENU(2 as *mut _),
             hinstance,
             None,
         ) {
