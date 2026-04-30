@@ -30,16 +30,20 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use native_windows_gui as nwg;
 
 use windows::core::{Interface, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
+use windows::Win32::System::Console::{
+    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
+};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern,
     TextUnit_Word, UIA_TextPatternId, UIA_ValuePatternId,
@@ -49,8 +53,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, GetMessageW, MessageBoxW, TranslateMessage,
-    MB_ICONERROR, MB_OK, MB_TOPMOST, MSG, SW_SHOWNORMAL, WM_HOTKEY,
+    DispatchMessageW, GetCursorPos, GetMessageW, MessageBoxW, PostThreadMessageW,
+    TranslateMessage, MB_ICONERROR, MB_OK, MB_TOPMOST, MSG, SW_SHOWNORMAL, WM_HOTKEY, WM_QUIT,
 };
 
 // ----- configuration --------------------------------------------------------
@@ -75,6 +79,34 @@ const SUBSTRING_MIN_LEN: usize = 3;
 fn popup_busy() -> &'static AtomicBool {
     static FLAG: OnceLock<AtomicBool> = OnceLock::new();
     FLAG.get_or_init(|| AtomicBool::new(false))
+}
+
+// ---------------------------------------------------------------------------
+// Console-control handler — intercepts Ctrl+C, Ctrl+Break and console-close
+// events so that they trigger a clean shutdown (exit code 0) instead of the
+// Windows default ExitProcess(STATUS_CONTROL_C_EXIT) which cargo reports as
+// "process didn't exit successfully".
+//
+// The handler runs on a thread created by Windows; we post WM_QUIT to the
+// main thread so the regular message loop exits and does its cleanup.
+// ---------------------------------------------------------------------------
+fn main_thread_id() -> &'static AtomicU32 {
+    static ID: OnceLock<AtomicU32> = OnceLock::new();
+    ID.get_or_init(|| AtomicU32::new(0))
+}
+
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
+            let tid = main_thread_id().load(Ordering::Relaxed);
+            if tid != 0 {
+                // Best-effort: ignore the return value.
+                let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+            BOOL(1) // handled — do NOT call the default handler
+        }
+        _ => BOOL(0), // not handled — pass to the next handler
+    }
 }
 
 // ----- entry point ----------------------------------------------------------
@@ -102,6 +134,12 @@ fn main() -> windows::core::Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
+        // Store the main thread ID and register a console-control handler so
+        // that Ctrl+C / Ctrl+Break / console-close cause a clean exit (code 0)
+        // rather than STATUS_CONTROL_C_EXIT.
+        main_thread_id().store(GetCurrentThreadId(), Ordering::Relaxed);
+        let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(1));
+
         RegisterHotKey(HWND::default(), HOTKEY_LOOKUP, MOD_CONTROL | MOD_SHIFT, VK_A)?;
         RegisterHotKey(HWND::default(), HOTKEY_EDIT,   MOD_CONTROL | MOD_SHIFT, VK_E)?;
         RegisterHotKey(HWND::default(), HOTKEY_QUIT,   MOD_CONTROL | MOD_SHIFT, VK_Q)?;
@@ -127,6 +165,9 @@ fn main() -> windows::core::Result<()> {
         let _ = UnregisterHotKey(HWND::default(), HOTKEY_LOOKUP);
         let _ = UnregisterHotKey(HWND::default(), HOTKEY_EDIT);
         let _ = UnregisterHotKey(HWND::default(), HOTKEY_QUIT);
+
+        // Remove the console-ctrl handler before we exit.
+        let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(0));
     }
     Ok(())
 }
