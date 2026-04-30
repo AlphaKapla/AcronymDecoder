@@ -681,7 +681,7 @@ fn show_popup(term: &str, result: LookupResult) {
                 break;
             }
             if IsDialogMessageW(hwnd, &msg_buf).0 == 0 {
-                TranslateMessage(&msg_buf);
+                let _ = TranslateMessage(&msg_buf);
                 DispatchMessageW(&msg_buf);
             }
         }
