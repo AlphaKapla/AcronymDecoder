@@ -437,7 +437,7 @@ fn extract_candidate_acronym(text: &str) -> Option<String> {
 }
 
 // ----- formatting -----------------------------------------------------------
-fn format_lookup(term: &str, result: &LookupResult) -> (String, String) {
+fn format_lookup(_term: &str, result: &LookupResult) -> (String, String) {
     match result {
         LookupResult::Exact(key, defs) => {
             let body = if defs.len() == 1 {
