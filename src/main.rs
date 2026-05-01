@@ -307,6 +307,8 @@ fn csv_path() -> PathBuf {
         }
     }
     // 3. Repo root at compile time — valid when running via `cargo run`.
+    //    `env!` panics at compile time if the variable is absent; it is always
+    //    set by Cargo so this is safe for normal builds.
     let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CSV_FILE_NAME);
     if dev_path.exists() {
         return dev_path;

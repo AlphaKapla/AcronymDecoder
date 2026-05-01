@@ -16,6 +16,7 @@ Two columns: acronym, definition. The program finds the file in this order:
 1. A path passed as a command-line argument.
 2. A file called `acronyms.csv` next to the `.exe` (standard location for a distributed binary).
 3. The `acronyms.csv` at the repository root, baked in at compile time — used automatically when you run the program with `cargo run`, so that file is the single source of truth during development.
+4. A file called `acronyms.csv` in the current working directory (last-resort fallback).
 
 To override with a custom path:
 
