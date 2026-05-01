@@ -775,8 +775,8 @@ unsafe extern "system" fn popup_wnd_proc(
             // Paint the read-only edit control with a white background and
             // near-black text, matching the window's own white background.
             let hdc = HDC(wparam.0 as *mut _);
-            SetBkColor(hdc, COLORREF(0x00FF_FFFF));    // white
-            SetTextColor(hdc, COLORREF(0x00_1A_1A_1A)); // near-black
+            SetBkColor(hdc, COLORREF(0x00FFFFFF));   // white (R=G=B=0xFF)
+            SetTextColor(hdc, COLORREF(0x001A1A1A)); // near-black (R=G=B=0x1A)
             // Return the COLOR_WINDOW+1 pseudo-brush (white).
             LRESULT(6)
         }
