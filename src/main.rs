@@ -43,8 +43,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{BOOL, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH, DEFAULT_GUI_FONT};
+use windows::Win32::Foundation::{BOOL, COLORREF, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontW, DeleteObject, GetStockObject, SetBkColor, SetTextColor,
+    HBRUSH, HDC, HFONT, DEFAULT_GUI_FONT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
@@ -74,8 +77,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsDialogMessageW, LoadCursorW, MB_ICONERROR, MB_OK, MB_TOPMOST, MessageBoxW, MSG,
     PostQuitMessage, PostThreadMessageW, RegisterClassExW, SendMessageW, SW_SHOWNORMAL,
     TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_SETFONT, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_EX_TOPMOST, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL, HMENU,
+    WM_CTLCOLOREDIT, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_SETFONT, WS_CAPTION, WS_CHILD,
+    WS_EX_STATICEDGE, WS_EX_TOPMOST, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL, HMENU,
 };
 
 // ----- configuration --------------------------------------------------------
@@ -768,6 +771,15 @@ unsafe extern "system" fn popup_wnd_proc(
             PostQuitMessage(0);
             LRESULT(0)
         }
+        WM_CTLCOLOREDIT => {
+            // Paint the read-only edit control with a white background and
+            // near-black text, matching the window's own white background.
+            let hdc = HDC(wparam.0 as *mut _);
+            SetBkColor(hdc, COLORREF(0x00FF_FFFF));    // white
+            SetTextColor(hdc, COLORREF(0x00_1A_1A_1A)); // near-black
+            // Return the COLOR_WINDOW+1 pseudo-brush (white).
+            LRESULT(6)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -786,17 +798,17 @@ fn show_popup(term: &str, result: LookupResult) {
             lpfnWndProc:   Some(popup_wnd_proc),
             hInstance:     hinstance,
             hCursor:       LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            // Standard Win32 trick: passing (COLOR_BTNFACE+1) as a pseudo-brush.
-            // COLOR_BTNFACE = 15, so 15+1 = 16.
-            hbrBackground: HBRUSH(16 as *mut _),
+            // White window background (COLOR_WINDOW+1 = 6) instead of the old
+            // gray button-face (COLOR_BTNFACE+1 = 16) for a clean modern look.
+            hbrBackground: HBRUSH(6 as *mut _),
             lpszClassName: class_name,
             ..Default::default()
         };
         let _ = RegisterClassExW(&wc);
 
-        // Compute total window size from the desired 520×320 client area.
-        let client_w: i32 = 520;
-        let client_h: i32 = 320;
+        // Compute total window size from the desired 560×380 client area.
+        let client_w: i32 = 560;
+        let client_h: i32 = 380;
         let mut rect = RECT { left: 0, top: 0, right: client_w, bottom: client_h };
         let _ = AdjustWindowRectEx(
             &mut rect,
@@ -834,21 +846,38 @@ fn show_popup(term: &str, result: LookupResult) {
             Err(_) => return,
         };
 
-        // Use the system GUI font (Segoe UI on Vista+, MS Shell Dlg 2 on XP).
-        let hfont = GetStockObject(DEFAULT_GUI_FONT);
+        // Use Segoe UI 11 pt (ClearType) for a crisp modern look.
+        // Fall back to the system DEFAULT_GUI_FONT if CreateFontW fails.
+        let hfont: HFONT = {
+            let f = CreateFontW(
+                -14,        // height ≈ 10.5 pt at 96 dpi (negative = character height)
+                0, 0, 0,    // width, escapement, orientation
+                400,        // FW_NORMAL
+                0, 0, 0,    // italic, underline, strikeout
+                1,          // DEFAULT_CHARSET
+                0,          // OUT_DEFAULT_PRECIS
+                0,          // CLIP_DEFAULT_PRECIS
+                5,          // CLEARTYPE_QUALITY
+                0,          // DEFAULT_PITCH | FF_DONTCARE
+                windows::core::w!("Segoe UI"),
+            );
+            if f.is_invalid() { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) } else { f }
+        };
 
         // Scrollable read-only edit control covering most of the client area.
+        // WS_EX_STATICEDGE gives a thin, flat border instead of the old 3-D
+        // sunken look (WS_EX_CLIENTEDGE), matching Windows 10/11 aesthetics.
         let body_w: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
         if let Ok(hedit) = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            WS_EX_STATICEDGE,
             windows::core::w!("EDIT"),
             PCWSTR(body_w.as_ptr()),
             WS_CHILD | WS_VISIBLE | WS_VSCROLL
                 | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
-            10,
-            10,
-            client_w - 24,
-            client_h - 70,
+            16,
+            16,
+            client_w - 32,
+            client_h - 76,
             hwnd,
             HMENU::default(),
             hinstance,
@@ -863,10 +892,10 @@ fn show_popup(term: &str, result: LookupResult) {
             windows::core::w!("BUTTON"),
             windows::core::w!("Close (Esc)"),
             WS_CHILD | WS_VISIBLE,
-            client_w - 124,
-            client_h - 48,
-            110,
-            28,
+            client_w - 130,
+            client_h - 50,
+            114,
+            32,
             hwnd,
             HMENU(2 as *mut _),
             hinstance,
@@ -888,6 +917,9 @@ fn show_popup(term: &str, result: LookupResult) {
                 DispatchMessageW(&msg_buf);
             }
         }
+
+        // Release the font created above (no-op when it is the stock font).
+        let _ = DeleteObject(hfont);
     }
 }
 
