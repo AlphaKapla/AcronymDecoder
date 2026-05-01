@@ -7,7 +7,8 @@
 //!
 //! The CSV file:
 //!   * Two columns: acronym, definition
-//!   * Lives next to the .exe by default (file name: `acronyms.csv`)
+//!   * Location priority: (1) CLI argument, (2) next to the .exe (deployed
+//!     binary), (3) repo root at compile time (development via `cargo run`)
 //!   * Override with a CLI argument:
 //!         acronym-lookup.exe "C:\path\to\my-list.csv"
 //!   * Reloaded on every press, so edits show up immediately
@@ -283,14 +284,35 @@ fn open_csv_in_editor() {
 use std::os::windows::ffi::OsStrExt;
 
 // ----- where the CSV lives --------------------------------------------------
+//
+// Priority:
+//   1. Explicit CLI argument.
+//   2. File next to the running executable (typical for a distributed binary).
+//   3. Compile-time repo root (baked in at build time — used when running via
+//      `cargo run` so the repo-root `acronyms.csv` is the single source of
+//      truth during development).
+//   4. Plain filename relative to the current working directory (last resort).
 fn csv_path() -> PathBuf {
+    // 1. Explicit CLI argument.
     if let Some(arg) = env::args().nth(1) {
         return PathBuf::from(arg);
     }
-    env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(CSV_FILE_NAME)))
-        .unwrap_or_else(|| PathBuf::from(CSV_FILE_NAME))
+    // 2. File next to the executable (distribution / release case).
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(CSV_FILE_NAME);
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    // 3. Repo root at compile time — valid when running via `cargo run`.
+    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CSV_FILE_NAME);
+    if dev_path.exists() {
+        return dev_path;
+    }
+    // 4. Last resort: bare filename in the current directory.
+    PathBuf::from(CSV_FILE_NAME)
 }
 
 // ----- CSV loader -----------------------------------------------------------

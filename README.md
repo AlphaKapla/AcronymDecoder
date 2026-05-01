@@ -11,9 +11,13 @@ and a popup shows the definition from your personal `acronyms.csv`.
 
 ## The CSV file
 
-Two columns: acronym, definition. By default the program looks for a
-file called `acronyms.csv` next to the `.exe`. Override with a CLI
-argument:
+Two columns: acronym, definition. The program finds the file in this order:
+
+1. A path passed as a command-line argument.
+2. A file called `acronyms.csv` next to the `.exe` (standard location for a distributed binary).
+3. The `acronyms.csv` at the repository root, baked in at compile time — used automatically when you run the program with `cargo run`, so that file is the single source of truth during development.
+
+To override with a custom path:
 
 ```powershell
 acronym-lookup.exe "C:\Users\me\Documents\my-acronyms.csv"
